@@ -8,4 +8,8 @@
     <IsAotCompatible>true</IsAotCompatible>
   </PropertyGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="Cellray.Tests" />
+  </ItemGroup>
+
 </Project>

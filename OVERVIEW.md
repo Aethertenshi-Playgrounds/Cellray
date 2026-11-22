@@ -19,6 +19,8 @@ src/
   CellrayDemo/    NativeAOT demo app showing every widget
   HelloCli/       first NativeAOT hello-world (1 line; proves the toolchain)
   TuiDemo/        leftover from before the rename; untracked, safe to delete
+tests/
+  Cellray.Tests/  xUnit tests (run frames headless against an in-memory screen)
 ```
 
 Apps built on Cellray live in their own repos, for example Farview (`../Cellray-projects/Farview`).
@@ -33,6 +35,19 @@ src/CellrayDemo/bin/Release/net10.0/win-x64/publish/CellrayDemo.exe     # [N] ru
 NativeAOT on Windows needs the .NET SDK plus the VS Build Tools C++ workload, and `vswhere.exe`
 (`C:\Program Files (x86)\Microsoft Visual Studio\Installer`) on `PATH`. A running copy of the exe locks the file, so
 close it before rebuilding.
+
+## Tests
+
+```powershell
+dotnet test tests/Cellray.Tests
+```
+
+The tests drive real frames: `Tui.InitHeadless(w, h)` gives an in-memory screen with no terminal, and
+`Input.TestFeed("...")` injects raw terminal bytes (text, `"\t"`, `"\x1b[B"`, SGR mouse reports) through the real
+parser. They are `internal` hooks exposed to the test assembly with `InternalsVisibleTo`. Because `Gui`, `Tui` and
+`Input` are process-wide static state, test parallelism is disabled. `WidgetIdentityTests` covers widget ids, focus
+and cursor state following a moved or reordered item, replacement at the same position, duplicate and unbalanced
+scopes, and state expiry.
 
 ## The frame loop
 
@@ -96,11 +111,17 @@ Esc quits by default; call `SetExitKey((ConsoleKey)0)` to handle it yourself wit
 | Meter | `Meter(x, y, width, percent[, gradient])`: row of `■` beads | |
 | Graph | `Graph(x, y, w, h, IReadOnlyList<float>, min, max, gradient, baseline)`: Braille dot graph | |
 
-Also `Gui.Disabled` (dims and disables everything drawn while it is true) and `Gui.FocusTextBox(rect)`.
+Also `Gui.Disabled` (dims and disables everything drawn while it is true), the identity functions `PushId` / `PopId` /
+`Scope`, `FocusNextWidget`, `FocusTextBox(rect)`, `ResetState`, and the diagnostics `DuplicateIdCount`,
+`UnbalancedScopeCount` and `StateTimeoutFrames` (see "How the immediate-mode GUI works").
 
 ## How the immediate-mode GUI works (`Gui.cs`)
 
-- **Identity**: no objects. A widget's id is a hash of (kind, x, y), so two different widgets at the same cell would clash.
+- **Identity**: there are no widget objects, so state is looked up by a per-widget id. Two modes:
+  - *Positional* (default, outside any scope): the id is a hash of (kind, x, y). Fine for fixed layouts, but the id *is* the position, so a widget that moves becomes a new widget, and a different widget drawn at that spot inherits its focus and cursor.
+  - *Scoped* (`Gui.PushId(key)` / `PopId()`, or `using (Gui.Scope(key)) { ... }`): the id is (scope key, kind, n-th widget of that kind in the scope) and ignores position. Use it for lists: scope each item by its own id and it keeps its focus and cursor when the list scrolls, sorts or filters. Keys can be integers or strings and scopes nest. Draw the same widgets in the same order for every item, or give each widget its own nested scope.
+  - Rules: an unmatched `PopId` throws; a missing `PopId` is closed at the end of the frame and counted in `Gui.UnbalancedScopeCount`; two sibling scopes with one key still get distinct ids (by order) but are counted in `Gui.DuplicateIdCount`. Focus is kept while its widget isn't drawn (so scrolling away and back keeps it), but an undrawn widget can't capture Esc or typing, and Tab then starts from the first widget. A text box's remembered cursor expires after `Gui.StateTimeoutFrames` unused frames (default 600); `Gui.ResetState()` clears everything, e.g. when switching screens.
+  - `Gui.FocusNextWidget()` focuses whatever widget is drawn next (works in any scope); `Gui.FocusTextBox(rect)` is the positional-only form.
 - **Focus order** is the order widgets are drawn in. `EndFrame` applies Tab / Shift+Tab to that list, so focus moves on the next frame. Clicking a widget focuses it; clicking empty space clears focus.
 - **Mouse**: a press over a widget makes it "active"; releasing over it counts as a click (so you can press, drag off and cancel). Sliders keep tracking while held.
 - **Overlays**: an open dropdown registers its list to be drawn in `EndFrame`, on top of everything, and widgets under its rectangle ignore the mouse. Its list height and above/below placement adapt to the screen.
@@ -118,4 +139,5 @@ Also `Gui.Disabled` (dims and disables everything drawn while it is true) and `G
 
 - **Tested**: Windows (Windows Terminal), including mouse, keyboard, all widgets, graphs, resizing, and a real app (Farview) over SSH.
 - **Not tested**: Linux and macOS (the raw-mode and input code is written but has never been run there), non-Windows-Terminal terminals, terminals without truecolor or mouse support (no 256/16-colour fallback yet).
+- **Next**: clipping and scrollable views (built on the scoped ids above), then list-based apps.
 - **Not done**: wide-character handling, radio groups laid out horizontally, dropdown scrollbar, key-up/held detection, an `IsKeyDown`, clipboard, a README, CI for Windows/Linux/macOS, and a NuGet package.

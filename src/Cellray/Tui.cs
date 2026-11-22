@@ -24,6 +24,8 @@ public static class Tui
     private static bool _initialized;
     private static bool _exitHooked;
     private static bool _escCaptured; // Esc belonged to a widget (open dropdown / focused text box) this frame
+    private static bool _headless;    // test mode: fixed size, nothing is written to a terminal
+    private static int _headlessW, _headlessH;
     private static bool _shouldClose;
     private static ConsoleKey _exitKey = ConsoleKey.Escape;
 
@@ -127,7 +129,7 @@ public static class Tui
     public static void BeginDrawing()
     {
         PollInput();
-        var (w, h) = Platform.GetSize();
+        var (w, h) = TerminalSize();
         if (w != _w || h != _h) Resize();
         Gui.BeginFrame();
     }
@@ -275,9 +277,22 @@ public static class Tui
 
     // ---- internals ------------------------------------------------------
 
+    private static (int Width, int Height) TerminalSize() => _headless ? (_headlessW, _headlessH) : Platform.GetSize();
+
+    /// <summary>Test hook: runs the frame loop against an in-memory screen of a fixed size, with no terminal and no stdin reader.</summary>
+    internal static void InitHeadless(int width, int height)
+    {
+        _headless = true;
+        _headlessW = width;
+        _headlessH = height;
+        _stdout = null; // Write() then does nothing
+        _shouldClose = false;
+        Resize();
+    }
+
     private static void Resize()
     {
-        (_w, _h) = Platform.GetSize();
+        (_w, _h) = TerminalSize();
         if (_w < 1) _w = 1;
         if (_h < 1) _h = 1;
         _back = new Cell[_w * _h];

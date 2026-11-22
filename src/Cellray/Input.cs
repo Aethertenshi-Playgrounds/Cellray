@@ -67,6 +67,31 @@ internal static class Input
         catch { /* stream closed */ }
     }
 
+    // ---- test hooks (InternalsVisibleTo) --------------------------------
+
+    /// <summary>Queues raw terminal input exactly as the stdin reader would, e.g. "abc", "\t", "\x1b[A", "\x1b[&lt;0;5;3M".</summary>
+    internal static void TestFeed(string text)
+    {
+        lock (Lock)
+        {
+            foreach (byte b in Encoding.UTF8.GetBytes(text)) Incoming.Add(b);
+        }
+    }
+
+    /// <summary>Forgets all queued and parsed input, mouse position and button state.</summary>
+    internal static void ResetForTests()
+    {
+        lock (Lock) { Incoming.Clear(); }
+        Pending.Clear();
+        Pressed.Clear();
+        Chars.Clear();
+        for (int i = 0; i < 3; i++) { Down[i] = false; MPressed[i] = false; MReleased[i] = false; }
+        CtrlC = false;
+        ShiftTab = false;
+        MouseX = MouseY = -1;
+        Wheel = 0;
+    }
+
     // ---- queries --------------------------------------------------------
 
     public static bool IsKeyPressed(ConsoleKey key) => Pressed.Contains(key);

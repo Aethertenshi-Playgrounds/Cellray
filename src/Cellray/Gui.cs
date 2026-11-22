@@ -24,7 +24,28 @@ public static class Gui
 
     // text boxes
     private static int _textFocusId; // text box that was drawn focused during the last frame
-    private static readonly Dictionary<int, (int Cursor, int Scroll)> TextStates = new();
+    private struct TextState { public int Cursor, Scroll, LastFrame; }
+    private static readonly Dictionary<int, TextState> TextStates = new();
+
+    // widget identity (see PushId)
+    private static readonly List<int> IdStack = new();                       // hashes of the open PushId scopes
+    private static readonly Dictionary<(int Scope, int Kind), int> Ordinals = new(); // widgets of a kind drawn so far in a scope this frame
+    private static readonly HashSet<int> ScopesSeen = new();                 // scope hashes pushed this frame (duplicate detection)
+    private static int _dupThisFrame, _unbalancedThisFrame;
+    private static bool _focusNextPending;
+    private static int _frame;
+
+    /// <summary>Scope keys that were pushed more than once in the last completed frame. Non-zero usually means a bug (two list items with the same id).</summary>
+    public static int DuplicateIdCount { get; private set; }
+
+    /// <summary>PushId calls without a PopId in the last completed frame (they are closed automatically at the end of the frame).</summary>
+    public static int UnbalancedScopeCount { get; private set; }
+
+    /// <summary>
+    /// How many frames an unused text box's remembered cursor/scroll position is kept before it is forgotten
+    /// (default 600, about 10 s at 60 fps). Set 0 to keep it forever. Focus is not affected by this.
+    /// </summary>
+    public static int StateTimeoutFrames { get; set; } = 600;
 
     // dropdown (only one can be open at a time)
     private static int _openDd;
@@ -51,7 +72,13 @@ public static class Gui
 
     internal static void BeginFrame()
     {
+        _frame++;
         Order.Clear();
+        Ordinals.Clear();
+        ScopesSeen.Clear();
+        IdStack.Clear();
+        _dupThisFrame = 0;
+        _unbalancedThisFrame = 0;
         _claimed = false;
         _ddSeen = false;
         _textFocusId = 0;
@@ -61,6 +88,21 @@ public static class Gui
     {
         foreach (var draw in Overlays) draw();
         Overlays.Clear();
+
+        // a PushId without PopId: close it so the mistake can't leak into the next frame
+        if (IdStack.Count > 0) { _unbalancedThisFrame += IdStack.Count; IdStack.Clear(); }
+        DuplicateIdCount = _dupThisFrame;
+        UnbalancedScopeCount = _unbalancedThisFrame;
+        _focusNextPending = false; // FocusNextWidget only applies to a widget drawn in the same frame
+
+        // forget the cursor of text boxes that haven't been drawn for a long time
+        if (StateTimeoutFrames > 0 && _frame % 16 == 0 && TextStates.Count > 0)
+        {
+            List<int>? stale = null;
+            foreach (var (id, st) in TextStates)
+                if (_frame - st.LastFrame > StateTimeoutFrames) (stale ??= new()).Add(id);
+            if (stale != null) foreach (int id in stale) TextStates.Remove(id);
+        }
 
         if (!_ddSeen) _openDd = 0; // dropdown disappeared while open
 
@@ -80,19 +122,117 @@ public static class Gui
 
     // ---- shared interaction logic ---------------------------------------
 
-    /// <summary>Gives keyboard focus to the text box that is (or will be) drawn with this rectangle, e.g. when a screen opens.</summary>
-    public static void FocusTextBox(Rect r) => _focus = Id(6, r.X, r.Y);
+    /// <summary>
+    /// Gives keyboard focus to the text box drawn with this rectangle, e.g. when a screen opens.
+    /// Only for widgets outside any <see cref="PushId(long)"/> scope (they are identified by position);
+    /// inside a scope use <see cref="FocusNextWidget"/>.
+    /// </summary>
+    public static void FocusTextBox(Rect r) => _focus = PositionalId(6, r.X, r.Y);
+
+    /// <summary>Gives keyboard focus to the next widget drawn this frame, wherever it is and however it is identified.</summary>
+    public static void FocusNextWidget() => _focusNextPending = true;
+
+    // ---- widget identity ------------------------------------------------
+    //
+    // Every widget needs a stable identity so focus, the pressed state and a text box's cursor follow it between frames.
+    //  * Outside any PushId scope the identity is (kind, x, y): fine for fixed layouts. The catch: it is the *position*,
+    //    so if a widget moves it becomes a new widget, and a different widget drawn at that spot inherits its state.
+    //  * Inside a PushId scope the identity is (scope key, kind, n-th widget of that kind in the scope), independent of
+    //    where it is drawn. A list can scroll, sort or filter its items and each item keeps its own focus and cursor.
+    //    Draw the same widgets in the same order for every item, or wrap each one in its own nested scope.
+    // Scopes nest: the key of an inner scope is combined with all outer ones.
+    // Two sibling scopes with the same key in one frame still get distinct widget ids (by order), but swapping them
+    // would swap their state, so the clash is counted in DuplicateIdCount.
+
+    /// <summary>Opens an identity scope. Widgets drawn until the matching <see cref="PopId"/> are identified by this key, not by position.</summary>
+    public static void PushId(long key)
+    {
+        int parent = IdStack.Count > 0 ? IdStack[IdStack.Count - 1] : 0x5C0DE;
+        int scope = Mix(parent, unchecked((int)key), unchecked((int)(key >> 32)));
+        if (!ScopesSeen.Add(scope)) _dupThisFrame++;
+        IdStack.Add(scope);
+    }
+
+    /// <summary>Opens an identity scope keyed by a string.</summary>
+    public static void PushId(string key)
+    {
+        unchecked
+        {
+            ulong h = 14695981039346656037UL; // FNV-1a, so ids don't depend on the runtime's randomised string hashing
+            foreach (char c in key ?? "") h = (h ^ c) * 1099511628211UL;
+            PushId((long)h);
+        }
+    }
+
+    /// <summary>Closes the innermost scope opened by PushId.</summary>
+    /// <exception cref="InvalidOperationException">There is no open scope.</exception>
+    public static void PopId()
+    {
+        if (IdStack.Count == 0) throw new InvalidOperationException("Gui.PopId() called without a matching Gui.PushId().");
+        IdStack.RemoveAt(IdStack.Count - 1);
+    }
+
+    /// <summary>Disposable form of PushId/PopId: <c>using (Gui.Scope(item.Id)) { ... }</c>.</summary>
+    public static IdScope Scope(long key) { PushId(key); return default; }
+
+    /// <summary>Disposable form of PushId/PopId keyed by a string.</summary>
+    public static IdScope Scope(string key) { PushId(key); return default; }
+
+    public readonly struct IdScope : IDisposable
+    {
+        public void Dispose() => PopId();
+    }
+
+    /// <summary>
+    /// Forgets all remembered widget state: focus, the held widget, open dropdown, text cursors and any open scopes.
+    /// Call it when switching to a completely different screen.
+    /// </summary>
+    public static void ResetState()
+    {
+        TextStates.Clear();
+        IdStack.Clear();
+        _active = _focus = _openDd = _textFocusId = 0;
+        _ddHighlight = _ddScroll = 0;
+        _focusNextPending = false;
+    }
 
     // widget kinds: 1 button, 2 checkbox, 3 toggle, 4 slider, 5 radio, 6 text box, 7 dropdown
     private static int Id(int kind, int x, int y)
     {
-        int id = HashCode.Combine(kind, x, y);
-        return id == 0 ? 1 : id;
+        if (IdStack.Count == 0) return PositionalId(kind, x, y);
+
+        int scope = IdStack[IdStack.Count - 1];
+        Ordinals.TryGetValue((scope, kind), out int n);
+        Ordinals[(scope, kind)] = n + 1;
+        return Mix(scope, kind, n);
     }
+
+    private static int PositionalId(int kind, int x, int y) => Mix(0x1D, kind, (x << 16) ^ y);
+
+    /// <summary>Deterministic 32-bit mixer (never returns 0, which means "no widget").</summary>
+    private static int Mix(int seed, int a, int b)
+    {
+        unchecked
+        {
+            uint h = 2166136261u;
+            h = (h ^ (uint)seed) * 16777619u; h ^= h >> 15;
+            h = (h ^ (uint)a) * 16777619u; h ^= h >> 13;
+            h = (h ^ (uint)b) * 16777619u; h ^= h >> 16;
+            return h == 0 ? 1 : (int)h;
+        }
+    }
+
+    // test hooks (InternalsVisibleTo)
+    internal static int LastId;
+    internal static int FocusedId => _focus;
+    internal static int TextCursor(int id) => TextStates.TryGetValue(id, out var s) ? s.Cursor : -1;
+    internal static bool HasTextState(int id) => TextStates.ContainsKey(id);
 
     private static State Update(int id, Rect r)
     {
         Order.Add(id);
+        LastId = id;
+        if (_focusNextPending) { _focus = id; _focusNextPending = false; }
         var s = new State();
         int mx = Tui.GetMouseX(), my = Tui.GetMouseY();
         bool hover = !Disabled && r.Contains(mx, my);
@@ -376,7 +516,7 @@ public static class Gui
 
         int id = Id(6, r.X, r.Y);
         var s = Update(id, r);
-        TextStates.TryGetValue(id, out var st);
+        TextStates.TryGetValue(id, out TextState st);
         int cursor = Math.Clamp(st.Cursor, 0, text.Length);
         int scroll = st.Scroll;
         bool changed = false;
@@ -413,7 +553,7 @@ public static class Gui
         if (cursor < scroll) scroll = cursor;
         if (cursor > scroll + iw - 1) scroll = cursor - iw + 1;
         scroll = Math.Clamp(scroll, 0, text.Length);
-        TextStates[id] = (cursor, scroll);
+        TextStates[id] = new TextState { Cursor = cursor, Scroll = scroll, LastFrame = _frame };
 
         // draw
         var line = LineColor(s);
@@ -451,13 +591,14 @@ public static class Gui
         if (n == 0) return false;
         bool changed = false;
         var states = new State[n];
+        var ids = new int[n]; // computed once, in order: inside an id scope each call to Id() advances the widget ordinal
+        for (int i = 0; i < n; i++) ids[i] = Id(5, x, y + i);
         bool moved = false; // an arrow key already moved focus this frame
 
         for (int i = 0; i < n; i++)
         {
             var r = new Rect(x, y + i, 4 + options[i].Length, 1);
-            int id = Id(5, x, y + i);
-            var s = Update(id, r);
+            var s = Update(ids[i], r);
             states[i] = s;
 
             if (s.Clicked || s.Activated)
@@ -468,11 +609,11 @@ public static class Gui
             {
                 if (Tui.IsKeyPressed(ConsoleKey.UpArrow) && i > 0)
                 {
-                    selected = i - 1; changed = true; moved = true; _focus = Id(5, x, y + i - 1);
+                    selected = i - 1; changed = true; moved = true; _focus = ids[i - 1];
                 }
                 else if (Tui.IsKeyPressed(ConsoleKey.DownArrow) && i < n - 1)
                 {
-                    selected = i + 1; changed = true; moved = true; _focus = Id(5, x, y + i + 1);
+                    selected = i + 1; changed = true; moved = true; _focus = ids[i + 1];
                 }
             }
         }
@@ -480,7 +621,7 @@ public static class Gui
         for (int i = 0; i < n; i++)
         {
             var s = states[i];
-            if (_focus == Id(5, x, y + i) && !Disabled) s.Focused = true; // focus may have just moved
+            if (_focus == ids[i] && !Disabled) s.Focused = true; // focus may have just moved
             var line = LineColor(s);
             Tui.DrawText("(", x, y + i, line);
             Tui.DrawText(selected == i ? "●" : " ", x + 1, y + i, Disabled ? Theme.InactiveFg : Theme.Ok);

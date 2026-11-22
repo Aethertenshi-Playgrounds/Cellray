@@ -4,4 +4,7 @@
     <Project Path="src/CellrayDemo/CellrayDemo.csproj" />
     <Project Path="src/HelloCli/HelloCli.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Cellray.Tests/Cellray.Tests.csproj" />
+  </Folder>
 </Solution>
