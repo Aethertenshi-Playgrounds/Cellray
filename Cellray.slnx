@@ -1,0 +1,7 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Cellray/Cellray.csproj" />
+    <Project Path="src/CellrayDemo/CellrayDemo.csproj" />
+    <Project Path="src/HelloCli/HelloCli.csproj" />
+  </Folder>
+</Solution>
