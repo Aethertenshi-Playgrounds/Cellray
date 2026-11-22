@@ -22,10 +22,11 @@ public static class Tui
     private static int _w, _h;
     private static bool _forceFull;
     private static bool _initialized;
+    private static bool _exitHooked;
+    private static bool _escCaptured; // Esc belonged to a widget (open dropdown / focused text box) this frame
     private static bool _shouldClose;
     private static ConsoleKey _exitKey = ConsoleKey.Escape;
 
-    private static readonly HashSet<ConsoleKey> _pressed = new();
     private static readonly Stopwatch _clock = Stopwatch.StartNew();
     private static long _lastFrameTicks;
     private static float _frameTime;
@@ -43,13 +44,20 @@ public static class Tui
         Platform.EnableVirtualTerminal();
         Platform.RaiseTimerResolution();
         Console.OutputEncoding = Encoding.UTF8;
-        try { Console.TreatControlCAsInput = true; } catch { }
         _stdout = Console.OpenStandardOutput();
         _initialized = true;
         _shouldClose = false;
 
-        // alternate screen, hide cursor, clear
-        Write("\x1b[?1049h\x1b[?25l\x1b[2J");
+        if (!_exitHooked)
+        {
+            _exitHooked = true;
+            AppDomain.CurrentDomain.ProcessExit += (_, _) => CloseTerminal(); // restore terminal even on unhandled exit
+        }
+
+        Input.Start();
+
+        // alternate screen, hide cursor, enable mouse (press/release + any-motion, SGR encoding), clear
+        Write("\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1003h\x1b[?1006h\x1b[2J");
         Resize();
         _lastFrameTicks = _clock.ElapsedTicks;
     }
@@ -57,14 +65,16 @@ public static class Tui
     public static void CloseTerminal()
     {
         if (!_initialized) return;
-        // reset attributes, show cursor, leave alternate screen
-        Write("\x1b[0m\x1b[?25h\x1b[?1049l");
-        try { Console.TreatControlCAsInput = false; } catch { }
-        Platform.RestoreTimerResolution();
         _initialized = false;
+        // mouse off, reset attributes, show cursor, leave alternate screen
+        Write("\x1b[?1006l\x1b[?1003l\x1b[?1000l\x1b[0m\x1b[?25h\x1b[?1049l");
+        Input.Stop();
+        Platform.RestoreTimerResolution();
     }
 
     public static bool ShouldClose() => _shouldClose;
+    /// <summary>Asks the main loop to finish (ShouldClose becomes true).</summary>
+    public static void RequestClose() => _shouldClose = true;
     public static void SetExitKey(ConsoleKey key) => _exitKey = key;
     public static void SetTargetFPS(int fps) => _targetFrameSeconds = fps > 0 ? 1.0 / fps : 0;
 
@@ -82,23 +92,34 @@ public static class Tui
 
     // ---- input ----------------------------------------------------------
 
-    /// <summary>True if the key was pressed since the last BeginDrawing.</summary>
-    public static bool IsKeyPressed(ConsoleKey key) => _pressed.Contains(key);
+    /// <summary>True if the key was pressed (or auto-repeated) since the last BeginDrawing.</summary>
+    public static bool IsKeyPressed(ConsoleKey key) => Input.IsKeyPressed(key);
+
+    /// <summary>Next typed character this frame, or '\0' when none are left (Raylib's GetCharPressed).</summary>
+    public static char GetCharPressed() => Input.NextChar();
+
+    /// <summary>
+    /// True when Esc was pressed this frame and no widget claimed it (an open dropdown or focused text box uses Esc itself).
+    /// Use it for app-level "back"/"quit" together with SetExitKey(0).
+    /// </summary>
+    public static bool IsEscapePressed() => Input.IsKeyPressed(ConsoleKey.Escape) && !_escCaptured;
+
+    public static int GetMouseX() => Input.MouseX;
+    public static int GetMouseY() => Input.MouseY;
+    public static (int X, int Y) GetMousePosition() => (Input.MouseX, Input.MouseY);
+    public static bool IsMouseButtonPressed(MouseButton b) => Input.MousePressed(b);
+    public static bool IsMouseButtonReleased(MouseButton b) => Input.MouseReleased(b);
+    public static bool IsMouseButtonDown(MouseButton b) => Input.MouseDown(b);
+    /// <summary>Scroll wheel movement this frame: positive = up.</summary>
+    public static int GetMouseWheelMove() => Input.Wheel;
 
     private static void PollInput()
     {
-        _pressed.Clear();
-        try
-        {
-            while (Console.KeyAvailable)
-            {
-                var k = Console.ReadKey(intercept: true);
-                _pressed.Add(k.Key);
-                if (k.Key == _exitKey) _shouldClose = true;
-                if (k.Key == ConsoleKey.C && (k.Modifiers & ConsoleModifiers.Control) != 0) _shouldClose = true;
-            }
-        }
-        catch (InvalidOperationException) { /* input redirected */ }
+        Input.Poll();
+        _escCaptured = Gui.CapturesEscape;
+        // Esc is left to an open dropdown / focused text box instead of quitting the app.
+        bool exitKey = Input.IsKeyPressed(_exitKey) && (_exitKey != ConsoleKey.Escape || !Gui.CapturesEscape);
+        if (exitKey || Input.CtrlC) _shouldClose = true;
     }
 
     // ---- drawing --------------------------------------------------------
@@ -108,6 +129,7 @@ public static class Tui
         PollInput();
         var (w, h) = Platform.GetSize();
         if (w != _w || h != _h) Resize();
+        Gui.BeginFrame();
     }
 
     public static void ClearBackground(Color color)
@@ -139,6 +161,9 @@ public static class Tui
         }
     }
 
+    /// <summary>Draws one character, keeping the cell's existing background.</summary>
+    public static void DrawChar(char c, int x, int y, Color fg) => Put(x, y, c, fg);
+
     public static void DrawRectangle(int x, int y, int width, int height, Color color)
     {
         int x0 = Math.Max(x, 0), y0 = Math.Max(y, 0);
@@ -152,13 +177,17 @@ public static class Tui
             }
     }
 
-    public static void DrawRectangleLines(int x, int y, int width, int height, Color color)
+    /// <summary>Thin box outline; rounded = btop-style corners.</summary>
+    public static void DrawRectangleLines(int x, int y, int width, int height, Color color, bool rounded = false)
     {
         if (width < 2 || height < 2) return;
-        Put(x, y, '\u250C', color); Put(x + width - 1, y, '\u2510', color);
-        Put(x, y + height - 1, '\u2514', color); Put(x + width - 1, y + height - 1, '\u2518', color);
-        for (int i = 1; i < width - 1; i++) { Put(x + i, y, '\u2500', color); Put(x + i, y + height - 1, '\u2500', color); }
-        for (int j = 1; j < height - 1; j++) { Put(x, y + j, '\u2502', color); Put(x + width - 1, y + j, '\u2502', color); }
+        // Box-drawing: square ┌ ┐ └ ┘, rounded ╭ ╮ ╰ ╯, lines ─ │
+        Put(x, y, rounded ? '╭' : '┌', color);
+        Put(x + width - 1, y, rounded ? '╮' : '┐', color);
+        Put(x, y + height - 1, rounded ? '╰' : '└', color);
+        Put(x + width - 1, y + height - 1, rounded ? '╯' : '┘', color);
+        for (int i = 1; i < width - 1; i++) { Put(x + i, y, '─', color); Put(x + i, y + height - 1, '─', color); }
+        for (int j = 1; j < height - 1; j++) { Put(x, y + j, '│', color); Put(x + width - 1, y + j, '│', color); }
     }
 
     private static void Put(int x, int y, char c, Color fg)
@@ -173,6 +202,7 @@ public static class Tui
 
     public static void EndDrawing()
     {
+        Gui.EndFrame();
         Flush();
         LimitFrameRate();
     }
@@ -196,12 +226,14 @@ public static class Tui
                     _sb.Append("\x1b[").Append(y + 1).Append(';').Append(x + 1).Append('H');
                 if (curFg != c.Fg)
                 {
-                    _sb.Append("\x1b[38;2;").Append(c.Fg.R).Append(';').Append(c.Fg.G).Append(';').Append(c.Fg.B).Append('m');
+                    if (c.Fg.IsDefault) _sb.Append("\x1b[39m");
+                    else _sb.Append("\x1b[38;2;").Append(c.Fg.R).Append(';').Append(c.Fg.G).Append(';').Append(c.Fg.B).Append('m');
                     curFg = c.Fg;
                 }
                 if (curBg != c.Bg)
                 {
-                    _sb.Append("\x1b[48;2;").Append(c.Bg.R).Append(';').Append(c.Bg.G).Append(';').Append(c.Bg.B).Append('m');
+                    if (c.Bg.IsDefault) _sb.Append("\x1b[49m");
+                    else _sb.Append("\x1b[48;2;").Append(c.Bg.R).Append(';').Append(c.Bg.G).Append(';').Append(c.Bg.B).Append('m');
                     curBg = c.Bg;
                 }
                 _sb.Append(c.Ch);
